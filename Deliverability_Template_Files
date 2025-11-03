@@ -1,0 +1,666 @@
+import os, glob, sys
+from string import Template
+
+# =============================================================================
+# Deliverability Template Generator (Python 3 + PSSE 35)
+# =============================================================================
+
+class Deliverability_Template_Files:
+
+    def tara_multi_transfer_limit(self):
+        return r"""import os, sys, glob, subprocess, csv
+from string import Template
+from itertools import islice
+
+# Try normal install first; fall back to network PyPackages if needed
+try:
+    import xlsxwriter
+except ImportError:
+    try:
+        sys.path.append(r'\\cpnasa\Planning\CAS\100_Automation Repository\Reliability_Assurance_Repo\PROD\PyPackages3')
+        import xlsxwriter
+    except Exception as e:
+        raise ImportError("xlsxwriter is required but not found. Install it or update the fallback path.") from e
+
+cwd = os.getcwd()
+
+# Read the TARA template safely
+with open("Template_TrLimMultiPath.txt", "r", encoding="utf-8") as filein:
+    src = Template(filein.read())
+
+# Ensure working subdirs exist
+for subdir in ["TrLim", "SubSysDetail", "WarnSum", "TempReports"]:
+    os.makedirs(os.path.join(cwd, subdir), exist_ok=True)
+
+# Helper: pick the first match or raise a clear error
+def first(pattern):
+    files = glob.glob(pattern)
+    if not files:
+        raise FileNotFoundError(f"No match for {pattern} in {cwd}")
+    return files[0]
+
+rawfile   = first("*.raw")
+subfile   = first("*.sub")
+monfile   = first("*.mon")
+confile   = first("*.con")
+excfile   = first("*.exc")
+transfile = first("Tara_Trans__*.csv")
+
+# Build transfers (use f-strings; %csv is literal text)
+transfers = ""
+count = 0
+with open(transfile, newline="") as _f:
+    traf = csv.reader(_f)
+    for row in traf:
+        if not row or "TARA " in row[0] or "Sending " in row[0]:
+            continue
+        source = str(row[0]).replace("-", "_").replace(".0", "")
+        sink   = str(row[1]).replace("-", "_").replace(".0", "")
+        amount = float(row[2])
+
+        # Skip if output already exists
+        out_csv = os.path.join(cwd, "TrLim", f"{source}_{sink}_TrLim.csv")
+        if os.path.isfile(out_csv):
+            continue
+
+        count += 1
+        transfers += (
+            f'opt trlim sendSysNameTrLim "{source}" recSysNameTrLim "{sink}" '
+            f'maxTransferTestMW {amount}  0 0\n'
+        )
+        transfers += f'trlim %save "TrLim\\{source}_{sink}_TrLim.csv" %csv scaleTrLim 0 0\n'
+
+# If any runs are queued, generate the TARA command file and run TARA
+if count != 0:
+    template_dic = {
+        "rawfile": rawfile, "subfile": subfile, "monfile": monfile,
+        "confile": confile, "excfile": excfile, "transfers": transfers
+    }
+    with open("Temp_TrLim_Multi.txt", "w+", encoding="utf-8") as text_file:
+        text_file.write(src.substitute(template_dic))
+
+    process = subprocess.Popen(['tara.exe', '%run Temp_TrLim_Multi.txt'])
+    process.wait()
+
+# ALWAYS build/refresh the workbook from TrLim CSVs (even if no new runs)
+workbook = xlsxwriter.Workbook('Proportional_Tranfer_Limit.xlsx')
+worksheet = workbook.add_worksheet("TrLim")
+
+format1 = workbook.add_format({'bold': True, 'font_size': '22', 'font_name': 'Courier New', 'font_color': '#FFFF00', 'bg_color': '#000080'})
+format2 = workbook.add_format({'bold': True, 'font_size': '10', 'font_name': 'Courier New', 'bg_color': '#C0C0C0'})
+format2.set_right()
+format3 = workbook.add_format({'font_size': '9', 'font_name': 'Courier New'})
+format_border = workbook.add_format({'font_size': '9', 'font_name': 'Courier New'}); format_border.set_border()
+format_3wnd = workbook.add_format({'font_size': '9', 'font_name': 'Courier New', 'bg_color': '#FFFF99'}); format_3wnd.set_border()
+
+intro_row = 0
+header_flag = 0
+row_num = 12
+
+for csvfile in glob.glob(os.path.join(cwd, "TrLim", "*.csv")):
+    with open(csvfile, newline="") as fh:
+        csvf = csv.reader(fh)
+
+        intro_lines = list(islice(csvf, 9))
+        header = list(islice(csvf, 1))
+
+        if intro_row == 0:
+            for row in intro_lines:
+                worksheet.write_row(intro_row, 0, row)
+                worksheet.set_row(intro_row, None, format3)
+                intro_row += 1
+
+        if header and header_flag == 0:
+            worksheet.write_row(11, 0, header[0], format2)
+            worksheet.autofilter(11, 0, 11, len(header[0]) - 1)
+            header_flag = 1
+
+        for row in csvf:
+            if row:
+                worksheet.write_row(row_num, 0, row, format_border)
+                row_num += 1
+
+workbook.close()"""
+
+    def tara_single_transfer_limit(self):
+        return r"""import os, glob, subprocess, csv
+from string import Template
+from itertools import islice
+
+# Try normal install first; fall back to network PyPackages if needed
+try:
+    import xlsxwriter
+except ImportError:
+    try:
+        import sys
+        sys.path.append(r'\\cpnasa\Planning\CAS\100_Automation Repository\Reliability_Assurance_Repo\PROD\PyPackages3')
+        import xlsxwriter
+    except Exception as e:
+        raise ImportError("xlsxwriter is required but not found. Install it or update the fallback path.") from e
+
+cwd = os.getcwd()
+
+with open("TrLim_Single.txt", "r", encoding="utf-8") as filein:
+    src = Template(filein.read())
+
+for subdir in ["TrLim", "SubSysDetail", "WarnSum", "TempReports"]:
+    os.makedirs(os.path.join(cwd, subdir), exist_ok=True)
+
+def first(pattern):
+    files = glob.glob(pattern)
+    if not files:
+        raise FileNotFoundError(f"No match for {pattern} in {cwd}")
+    return files[0]
+
+rawfile   = first("*.raw")
+subfile   = first("*.sub")
+monfile   = first("*.mon")
+confile   = first("*.con")
+excfile   = first("*.exc")
+transfile = first("Tara_Trans__*.csv")
+
+with open(transfile, newline="") as _f:
+    traf = csv.reader(_f)
+    for row in traf:
+        if not row or "TARA " in row[0] or "Sending " in row[0]:
+            continue
+        source = str(row[0]).replace("-", "_")
+        sink   = str(row[1]).replace("-", "_")
+        amount = int(round(float(row[2]), 0))
+        out_csv = os.path.join(cwd, "TrLim", f"{source}_{sink}_{amount}_TrLim.csv")
+        if os.path.isfile(out_csv):
+            continue
+
+        template_dic = {
+            "rawfile": rawfile, "subfile": subfile, "monfile": monfile,
+            "confile": confile, "excfile": excfile,
+            "source": source, "sink": sink, "amount": amount
+        }
+        with open("Temp_TrLim_Single.txt", "w+", encoding="utf-8") as text_file:
+            text_file.write(src.substitute(template_dic))
+
+        process = subprocess.Popen(['tara.exe', '%run Temp_TrLim_Single.txt'])
+        process.wait()
+
+# Build/refresh the workbook
+workbook = xlsxwriter.Workbook('Proportional_Tranfer_Limit.xlsx')
+worksheet = workbook.add_worksheet("TrLim")
+
+format1 = workbook.add_format({'bold': True, 'font_size': '22', 'font_name': 'Courier New', 'font_color': '#FFFF00', 'bg_color': '#000080'})
+format2 = workbook.add_format({'bold': True, 'font_size': '10', 'font_name': 'Courier New', 'bg_color': '#C0C0C0'})
+format2.set_right()
+format3 = workbook.add_format({'font_size': '9', 'font_name': 'Courier New'})
+format_border = workbook.add_format({'font_size': '9', 'font_name': 'Courier New'}); format_border.set_border()
+format_3wnd = workbook.add_format({'font_size': '9', 'font_name': 'Courier New', 'bg_color': '#FFFF99'}); format_3wnd.set_border()
+
+intro_row = 0
+header_flag = 0
+row_num = 12
+
+for csvfile in glob.glob(os.path.join(cwd, "TrLim", "*.csv")):
+    with open(csvfile, newline="") as fh:
+        csvf = csv.reader(fh)
+
+        intro_lines = list(islice(csvf, 9))
+        header = list(islice(csvf, 1))
+
+        if intro_row == 0:
+            for row in intro_lines:
+                worksheet.write_row(intro_row, 0, row)
+                worksheet.set_row(intro_row, None, format3)
+                intro_row += 1
+
+        if header and header_flag == 0:
+            worksheet.write_row(11, 0, header[0], format2)
+            worksheet.autofilter(11, 0, 11, len(header[0]) - 1)
+            header_flag = 1
+
+        for row in csvf:
+            if row:
+                worksheet.write_row(row_num, 0, row, format_border)
+                row_num += 1
+
+workbook.close()"""
+
+    # ------------------------------ TARA TEMPLATES (PSSE 35) ------------------------------
+
+    def tara_trlim_multipath(self, psse_version):
+        # NOTE: rf-string so we can inject {psse_version} AND keep backslashes.
+        # All ${...} that should be substituted LATER by Template.substitute()
+        # are escaped as ${{...}} so they survive this format pass.
+        return rf"""%trace "taralog.txt" %txt
+lfopt adj
+ iterCheckVarLimitHotStart  0
+ iterCheckVarLimitFlat      3
+ PAR_AdjEnabledLF           1  
+ areaInterAdjustEnabled     0
+ TAP_AdjEnabledLF           1  
+ shuntAdjEnabled            0 
+ DCLineAdjEnabled           1
+ showParAdj                 1  
+ showTapAdj                 1  
+ showShuntAdj               1  
+ showAreaInterAdj           1  
+ busMismTolerAreaInter      5  
+ maxVarLimitsBusTypeChanges 6
+ iterCheckVarLimitLast      40 
+ maxAdjustIterVolt          30
+ deacFactRTap               1
+ maxTapChange               0.02   
+ voltAdjTrigger             0.3    
+ angleAdjTrigger            0.2
+ showBusTypeChan            0
+ deOscilFactor              0.7
+0 0
+opt N-1-1
+ consPerMonBran         5
+ consPerMonBus          5
+0 0
+opt EMS
+ emsNamingMethod  1
+ useAUXMonStatus  0
+ reduceCaseMode   0
+ neOverrideFormat 0
+0 0
+lfopt misc
+ maxBuses       95000
+ maxBranches    190000
+ maxLoads       190000
+ maxShunts      15000
+ maxTransfor    30000
+ maxGenerators  25000
+0 0
+opt sced options
+ maxBidPoints  10000
+ MAXBIDBLOCKS  100000
+ maxZonFactors 40000
+0 0 0
+opt sced options
+ CPNODEMAX      10
+ CPNODEPERBUS   10
+0 0 0
+lfopt solve
+ busMismToler        1
+ MaxIterLF           50
+ useFlatStart        0
+ ZeroImpThr          0.0001
+ lowVoltCutOffLoad   0.8
+ maxVoltChangeInit   0.2
+ maxAngleChangeInit  3
+ maxVoltChangeFinal  0.15
+ maxAngleChangeFinal 1
+ numIterInit         3
+ MemFactor           5
+ voltTolnUser        0
+ lowVoltAddQGen      0
+ lowVoltCutOffQGen   0.7
+ highVoltReduceQGen  0
+ highVoltCutOffQGen  1.3
+ fixedQGenRelax      0
+ lowVoltAddShunt     0
+ lowVoltCutOffShunt  0.7
+ highVoltReduceShunt 0
+ highVoltCutOffShunt 1.25
+ 0 0
+lfopt adj
+ iterCheckVarLimitHotStart  0
+ iterCheckVarLimitFlat      3
+ PAR_AdjEnabledLF           1  
+ areaInterAdjustEnabled     0
+ TAP_AdjEnabledLF           1  
+ shuntAdjEnabled            0  
+ DCLineAdjEnabled           1
+ showParAdj                 1  
+ showTapAdj                 1 
+ showShuntAdj               1  
+ showAreaInterAdj           1  
+ busMismTolerAreaInter      5  
+ maxVarLimitsBusTypeChanges 6
+ iterCheckVarLimitLast      40 
+ maxAdjustIterVolt          30
+ deacFactRTap               1
+ maxTapChange               0.02   
+ voltAdjTrigger             0.3    
+ angleAdjTrigger            0.2
+ showBusTypeChan            0
+ deOscilFactor              0.7
+0 0
+lfopt misc
+ useCaseNameFullPath   0
+ branNamePrefix        "/* ["
+ branNameSuffix        "]"
+ readEquipNamesFromRAW 0
+ reportBusAreaName     0
+ reportBusZoneName     0
+0 0
+opt screen
+ limitFgateName40       0
+0 0
+READ PSSE {psse_version} "${{rawfile}}" 0 0
+opt cont StudyFiles 1 0 0 0
+lfopt misc
+ busOutputMode 2 0 0
+solve
+ fdec 0 0
+opt amb
+general
+ useFirmTransOnly     1
+ AMBStartDateMethod   0
+ AMB_CommandFile      "amb_snapshot.dir"
+ optBuildSnapNEScreen 0
+0
+param
+ MAXHOURS_AMB         8760
+ MAXDAYS_AMB          1096
+ MAXWEEKS_AMB         104
+ MAXMONTHS_AMB        120
+ SDXGensMax           200000
+ SDXBranMax           10000
+ SDX_3WTranMax        10000
+ useGrossLoadForecast 1
+ adjustAreaWithNoLoad 1
+ GMTShiftEngine       5
+ stopAMBOnLoadError   0
+ TDFSaveFormat        0
+ TDFSaveModeHourly    1
+ TDFSaveCutOffHoulry  0.01
+0
+hourly
+ SchedLookAhead     1
+ AMB_LookAhead      1
+ useSlidingWindow   1
+ SlidingWindowHours 10
+0
+long
+ AMBPeriodType             2
+ OffPeakLoadScaleFact      0.85
+ FirstHourPeak             11
+ LastHourPeak              21
+ FirstHourOffPeak          3
+ LastHourOffPeak           5
+ AMB_RepresentWeekDay      3
+ AMB_RepresentWeekNumber   3
+ adjustDailyLoadForProfile 0
+0
+ems
+ EMSFlowsEnable          0
+ EMSFlowsHoursFullImpact 4
+ EMSFlowsLastHour        8
+ EMSFlowsType            3
+ EMSFlowsUsePartial      0
+0
+0 0
+ READ SUBSYS "${{subfile}}"
+ CONT "${{confile}}"
+ MONIT "${{monfile}}"
+ EXC "${{excfile}}" 0
+ 0
+opt cont StudyFiles 0 0 0 0
+lfreview  %save "TempReports\temp_report3.txt" %csv subsys 0
+lfreview  %save "TempReports\temp_report1.txt" %csv larea 0
+lfreview  %save "TempReports\temp_report5.txt" %csv tzone 1 0
+opt cont StudyFiles 1 0 0 0
+warn %save "WarnSum\Warn_Sum_Term.csv"  %csv term 0 0
+warn %save "WarnSum\Warn_Sum.csv"  %csv sum 0 0
+lfreview %save "WarnSum\CaseSum.csv"  %csv sum 0 0
+opt trlim
+ TrLimMode           1
+0 0
+opt trlim
+ SensCutOff            0.03
+ maxViolPerCons        5
+ reportInitViol        0
+ maxConstraintsPerPath 999
+ reportPathName        2
+ PVStepMW              200
+ ScreeningStepMW       200    
+ pvAddBaseCase         0        
+0 0
+RPTManager TrLim
+ reportPathName    2
+ FacilityNameParse 1
+ Area              1
+ AreaName          1
+ Zone              1
+ ZoneName          1
+ ExtBusName        0
+ DetailContEvent   0
+0 0
+${{transfers}}
+opt trlim
+ reportPathName        0
+0 0
+0 0 0 STOP
+"""
+
+    def tara_trlim_single(self):
+        return r"""%trace "taralog.txt" %txt
+lfopt adj
+ iterCheckVarLimitHotStart  0
+ iterCheckVarLimitFlat      3
+ PAR_AdjEnabledLF           1  
+ areaInterAdjustEnabled     0
+ TAP_AdjEnabledLF           1  
+ shuntAdjEnabled            0  
+ DCLineAdjEnabled           1
+ showParAdj                 1  
+ showTapAdj                 1  
+ showShuntAdj               1  
+ showAreaInterAdj           1  
+ busMismTolerAreaInter      5  
+ maxVarLimitsBusTypeChanges 6
+ iterCheckVarLimitLast      40 
+ maxAdjustIterVolt          30
+ deacFactRTap               1
+ maxTapChange               0.02   
+ voltAdjTrigger             0.3    
+ angleAdjTrigger            0.2
+ showBusTypeChan            0
+ deOscilFactor              0.7
+0 0
+opt N-1-1
+ consPerMonBran         5
+ consPerMonBus          5
+0 0
+opt EMS
+ emsNamingMethod  1
+ useAUXMonStatus  0
+ reduceCaseMode   0
+ neOverrideFormat 0
+0 0
+lfopt misc
+ maxBuses       95000
+ maxBranches    190000
+ maxLoads       190000
+ maxShunts      15000
+ maxTransfor    30000
+ maxGenerators  25000
+0 0
+opt sced options
+ maxBidPoints  10000
+ MAXBIDBLOCKS  100000
+ maxZonFactors 40000
+0 0 0
+opt sced options
+ CPNODEMAX      10
+ CPNODEPERBUS   10
+0 0 0
+lfopt solve
+ busMismToler        1
+ MaxIterLF           50
+ useFlatStart        0
+ ZeroImpThr          0.0001
+ lowVoltCutOffLoad   0.8
+ maxVoltChangeInit   0.2
+ maxAngleChangeInit  3
+ maxVoltChangeFinal  0.15
+ maxAngleChangeFinal 1
+ numIterInit         3
+ MemFactor           5
+ voltTolnUser        0
+ lowVoltAddQGen      0
+ lowVoltCutOffQGen   0.7
+ highVoltReduceQGen  0
+ highVoltCutOffQGen  1.3
+ fixedQGenRelax      0
+ lowVoltAddShunt     0
+ lowVoltCutOffShunt  0.7
+ highVoltReduceShunt 0
+ highVoltCutOffShunt 1.25
+ 0 0
+lfopt adj
+ iterCheckVarLimitHotStart  0
+ iterCheckVarLimitFlat      3
+ PAR_AdjEnabledLF           1  
+ areaInterAdjustEnabled     0
+ TAP_AdjEnabledLF           1 
+ shuntAdjEnabled            0 
+ DCLineAdjEnabled           1
+ showParAdj                 1  
+ showTapAdj                 1  
+ showShuntAdj               1  
+ showAreaInterAdj           1  
+ busMismTolerAreaInter      5  
+ maxVarLimitsBusTypeChanges 6
+ iterCheckVarLimitLast      40 
+ maxAdjustIterVolt          30
+ deacFactRTap               1
+ maxTapChange               0.02   
+ voltAdjTrigger             0.3   
+ angleAdjTrigger            0.2
+ showBusTypeChan            0
+ deOscilFactor              0.7
+0 0
+lfopt misc
+ useCaseNameFullPath   0
+ branNamePrefix        "/* ["
+ branNameSuffix        "]"
+ readEquipNamesFromRAW 0
+ reportBusAreaName     0
+ reportBusZoneName     0
+0 0
+opt screen
+ limitFgateName40       0
+0 0
+READ PSSE 35 "${rawfile}" 0 0 
+opt cont StudyFiles 1 0 0 0
+lfopt misc
+ busOutputMode 2 0 0
+solve
+ fdec 0 0
+opt amb
+general
+ useFirmTransOnly     1
+ AMBStartDateMethod   0
+ AMB_CommandFile      "amb_snapshot.dir"
+ optBuildSnapNEScreen 0
+0
+param
+ MAXHOURS_AMB         8760
+ MAXDAYS_AMB          1096
+ MAXWEEKS_AMB         104
+ MAXMONTHS_AMB        120
+ SDXGensMax           200000
+ SDXBranMax           10000
+ SDX_3WTranMax        10000
+ useGrossLoadForecast 1
+ adjustAreaWithNoLoad 1
+ GMTShiftEngine       5
+ stopAMBOnLoadError   0
+ TDFSaveFormat        0
+ TDFSaveModeHourly    1
+ TDFSaveCutOffHoulry  0.01
+0
+hourly
+ SchedLookAhead     1
+ AMB_LookAhead      1
+ useSlidingWindow   1
+ SlidingWindowHours 10
+0
+long
+ AMBPeriodType             2
+ OffPeakLoadScaleFact      0.85
+ FirstHourPeak             11
+ LastHourPeak              21
+ FirstHourOffPeak          3
+ LastHourOffPeak           5
+ AMB_RepresentWeekDay      3
+ AMB_RepresentWeekNumber   3
+ adjustDailyLoadForProfile 0
+0
+ems
+ EMSFlowsEnable          0
+ EMSFlowsHoursFullImpact 4
+ EMSFlowsLastHour        8
+ EMSFlowsType            3
+ EMSFlowsUsePartial      0
+0
+0 0
+ READ SUBSYS "${subfile}"
+ CONT "${confile}"
+ MONIT "${monfile}"
+ EXC "${excfile}" 0
+ 0
+opt cont StudyFiles 0 0 0 0
+lfreview  %save "TempReports\temp_report3.txt" %csv subsys 0
+lfreview  %save "TempReports\temp_report1.txt" %csv larea 0
+lfreview  %save "TempReports\temp_report5.txt" %csv tzone 1 0
+opt cont StudyFiles 1 0 0 0
+warn %save "WarnSum\Warn_Sum_Term.csv"  %csv term 0 0
+warn %save "WarnSum\Warn_Sum.csv"  %csv sum 0 0
+lfreview %save "WarnSum\CaseSum.csv"  %csv sum 0 0
+opt trlim
+ TrLimMode           0
+0 0
+opt cont
+ showConAnalLFLog     0
+ ACCONTRepeatSolution 0
+0 0
+lfopt accont
+ TAPadjACCont        0
+ PARadjACCont        0
+ GenLoclACCont       1
+ SWSHadjACCont       0
+ AIadjACCont         0
+ lockOscShuntACCont  0
+ runTLCpjmEMS        0
+0 0
+opt trlim
+ sendSysNameTrLim     "${source}"
+ recSysNameTrLim      "${sink}"
+ SensCutOff           0.0299
+ maxTransferTestMW    ${amount}
+ maxViolPerCons       1
+ reportInitViol       1
+ reportFlowgate       0
+ acVerifyAll          1
+ numToACVerify        10
+ PVStepMW             200
+ ScreeningStepMW      200  
+ pvAddBaseCase        0         
+0 0
+RPTManager TrLim
+ reportPathName    2
+ FacilityNameParse 1
+ Area              1
+ AreaName          1
+ Zone              1
+ ZoneName          1
+ ExtBusName        0
+ DetailContEvent   0
+0 0
+trlim acScaleTrLim 0 0
+trlim %save "TrLim\${source}_${sink}_${amount}_TrLim.csv"  %csv ACThermal 0 0
+trlim %save "SubSysDetail\${source}_${sink}_${amount}_TrLimSubSysDetail.csv"  %csv SubSysDetail 0 0
+0 0 0 STOP
+0 0 0 STOP"""
+
+    # ------------------------------ TARA CONFIG ------------------------------
+
+    def tara_config(self):
+        return r"""
+1TO1
+1GD1
+
+1AM1
+1SC1"""
