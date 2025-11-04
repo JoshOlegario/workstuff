@@ -1,0 +1,1334 @@
+import sys, os, glob, re, shutil, winreg, subprocess, time, timeit
+from Excel_Document import Excel_Document
+from Deliverability_Template_Files import Deliverability_Template_Files
+from EasyTools import Entry
+
+from typing import List, Dict, Tuple, Any
+
+def normalize_bus(v: Any) -> str:
+    return str(int(float(v)))  # 547997.0 -> "547997"
+
+def normalize_id(v):
+    s = str(v).strip()
+    # Only normalize numeric IDs
+    if s.replace('.', '').replace('-', '').isdigit():
+        try:
+            return str(int(float(s)))
+        except:
+            pass
+    return s.upper()
+
+# 1. Ensure required folders exist
+def Check_Directories(pathlist, cases):
+    # 1.1 Loop through each root path
+    for path in pathlist:
+        # 1.1.1 Create root path if missing
+        if not os.path.exists(path):
+            os.makedirs(path)
+        # 1.1.2 Within each root, ensure a folder per case
+        for case in cases:
+            target = os.path.join(path, case)
+            if not os.path.exists(target):
+                os.makedirs(target)
+
+
+# 2. Initialize PSSE environment
+def init_psse(psse_version):
+    # 2.1 Look up PSSE install path in registry
+    try:
+        # Try 64-bit registry first
+        pssepath, regtype = winreg.QueryValueEx(
+            winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                f"SOFTWARE\\PTI\\PSSE {psse_version}\\6\\Product Paths",
+                0,
+                winreg.KEY_READ | winreg.KEY_WOW64_64KEY
+            ),
+            "PsseInstallPath"
+        )
+    except OSError:
+        # Fall back to 32-bit registry
+        try:
+            pssepath, regtype = winreg.QueryValueEx(
+                winreg.OpenKey(
+                    winreg.HKEY_LOCAL_MACHINE,
+                    f"SOFTWARE\\Wow6432Node\\PTI\\PSSE {psse_version}\\6\\Product Paths",
+                    0,
+                    winreg.KEY_READ
+                ),
+                "PsseInstallPath"
+            )
+        except OSError:
+            raise RuntimeError(f"PSSE {psse_version} not found in registry")
+
+    # 2.2 Validate PSSE path
+    if not os.path.exists(pssepath) or "PTI\\PSSE" not in pssepath:
+        print(f"ERROR: Cannot find PSS(R)E Version {psse_version}.")
+        print(
+            "INFO: To get the required version of PSS(R)E go to: P:\\Models_and_Programs\\PTI Programs\\PSSE and run setup.exe.")
+        sys.exit(1)
+
+    # 2.3 Clean sys.path of any existing PSSE paths to avoid conflicts
+    original_path = sys.path.copy()
+    sys.path = [p for p in sys.path if 'PSSE' not in p or 'PSSPY' not in p]
+
+    # 2.4 Add DLL directories for Windows DLL loading (Python 3.8+)
+    try:
+        os.add_dll_directory(os.path.join(pssepath, 'PSSBIN'))
+        os.add_dll_directory(os.path.join(pssepath, 'PSSLIB'))
+    except AttributeError:
+        # Python < 3.8 doesn't have add_dll_directory
+        pass
+
+    # 2.5 Add PSSE paths to sys.path and environment PATH
+    pssbin_path = os.path.join(pssepath, 'PSSBIN')
+    psslib_path = os.path.join(pssepath, 'PSSLIB')
+
+    sys.path.append(pssbin_path)
+    sys.path.append(psslib_path)
+    os.environ['PATH'] += f';{pssbin_path};{psslib_path}'
+
+    # 2.6 Add correct PSSPY path for current Python version
+    python_major = sys.version_info.major
+    python_minor = sys.version_info.minor
+    psspy_folder = f"PSSPY{python_major}{python_minor}"
+    api_path = os.path.join(pssepath, psspy_folder)
+
+    if os.path.isdir(api_path):
+        sys.path.append(api_path)
+        os.environ['PATH'] += f";{api_path}"
+        print(f"Using PSSE Python API: {psspy_folder}")
+    else:
+        # Fallback: find available PSSPY folders and use the highest version
+        available = [f for f in os.listdir(pssepath)
+                     if f.upper().startswith("PSSPY") and os.path.isdir(os.path.join(pssepath, f))]
+        if available:
+            chosen = sorted(available)[-1]  # Highest version
+            api_path = os.path.join(pssepath, chosen)
+            sys.path.append(api_path)
+            os.environ['PATH'] += f";{api_path}"
+            print(f"Warning: PSSPY{python_major}{python_minor} not found, using {chosen}")
+        else:
+            raise RuntimeError(f"No PSSPY folders found under {pssepath}")
+
+    # 2.7 Clear any cached psspy modules to avoid stale imports
+    modules_to_clear = [name for name in sys.modules.keys() if 'psspy' in name.lower()]
+    for module_name in modules_to_clear:
+        del sys.modules[module_name]
+
+    # 2.8 Import and verify PSSE Python API
+    global psspy
+    print("sys.path before import:")
+    for i, p in enumerate(sys.path):
+        marker = " *** PSSPY ***" if "PSSPY" in p else ""
+        print(f"  {i}: {p}{marker}")
+
+    print(f"Attempting to import psspy from: {api_path}")
+
+    try:
+        import psspy
+        print(f"SUCCESS: PSSE {psse_version} loaded")
+    except ImportError as e:
+        if "bad magic number" in str(e):
+            print(f"ERROR: Python version mismatch in PSSE installation.")
+            print(f"Your Python: {sys.version}")
+            print(f"Try deleting .pyc files in: {api_path}")
+        else:
+            print(f"ERROR: Failed to import psspy: {e}")
+        sys.path = original_path  # Restore original path
+        sys.exit(1)
+
+    # 2.9 Initialize PSSE engine and logging channels
+    try:
+        psspy.psseinit(150000)
+        ierr = psspy.progress_output(6, None, None)
+        ierr = psspy.report_output(6, None, None)
+        ierr = psspy.prompt_output(6, None, None)
+        ierr = psspy.alert_output(6, None, None)
+
+        # 2.10 Retrieve and display version metadata
+        name, major, minor, modlvl, date, stat = psspy.psseversion()
+        print(f"PSSE Version: {name} {major}.{minor}.{modlvl} ({date})")
+
+    except Exception as e:
+        print(f"ERROR: Failed to initialize PSSE: {e}")
+        sys.exit(1)
+
+    # 2.11 Set up PSSE marker types for global use
+    global _i, _f, _s
+    _i, _f, _s = psspy._i, psspy._f, psspy._s
+
+    print("PSSE initialization complete")
+# # 2. Initialize PSSE environment
+# def init_psse(psse_version):
+#     # 2.1 Look up PSSE install path in 64-bit registry
+#     try:
+#         pssepath, regtype = winreg.QueryValueEx(
+#             winreg.OpenKey(
+#                 winreg.HKEY_LOCAL_MACHINE,
+#                 "SOFTWARE\\PTI\\PSSE %s\\6\\Product Paths" % psse_version,
+#                 0,
+#                 winreg.KEY_READ | winreg.KEY_WOW64_64KEY
+#             ),
+#             "PsseInstallPath"
+#         )
+#     # 2.2 If that fails, fall back to 32-bit registry
+#     except OSError:
+#         pssepath, regtype = winreg.QueryValueEx(
+#             winreg.OpenKey(
+#                 winreg.HKEY_LOCAL_MACHINE,
+#                 "SOFTWARE\\Wow6432Node\\PTI\\PSSE %s\\6\\Product Paths" % psse_version,
+#                 0,
+#                 winreg.KEY_READ
+#             ),
+#             "PsseInstallPath"
+#         )
+#     # 2.2.5 Add DLL directories for Python 3.8+
+#     os.add_dll_directory(os.path.join(pssepath, 'PSSBIN'))
+#     os.add_dll_directory(os.path.join(pssepath, 'PSSLIB'))
+#
+#     # 2.3 Tell Python where to find PSSE binaries & libs
+#     sys.path.append(os.path.join(pssepath, 'PSSBIN'))
+#     sys.path.append(os.path.join(pssepath, 'PSSLIB'))
+#
+#     # 2.4 Also add them to OS PATH so Windows can locate DLLs/exes
+#     os.environ['PATH'] += ';' + os.path.join(pssepath, 'PSSBIN')
+#     os.environ['PATH'] += ';' + os.path.join(pssepath, 'PSSLIB')
+#
+#     # 2.5 Use the correct PSSPY folder for the specified Python version
+#     python_major = sys.version_info.major
+#     python_minor = sys.version_info.minor
+#     psspy_folder = f"PSSPY{python_major}{python_minor}"  # e.g., "PSSPY39" for Python 3.9
+#
+#     api_path = os.path.join(pssepath, psspy_folder)
+#     if os.path.isdir(api_path):
+#         sys.path.append(api_path)
+#         os.environ['PATH'] += ";" + api_path
+#     else:
+#         # Fallback: try the old auto-detection but prefer higher versions
+#         available = [f for f in os.listdir(pssepath) if f.upper().startswith("PSSPY")]
+#         if available:
+#             # Sort to get the highest version last, then take it
+#             chosen = sorted(available)[-1]
+#             api_path = os.path.join(pssepath, chosen)
+#             sys.path.append(api_path)
+#             os.environ['PATH'] += ";" + api_path
+#         else:
+#             raise RuntimeError(f"No PSSPY* folder found under {pssepath}")
+#
+#     # # 2.5 Auto-detect the PSSE Python API folder (PSSPY*, e.g. PSSPY3, PSSPY38, etc.)
+#     # for folder in os.listdir(pssepath):
+#     #     if folder.upper().startswith("PSSPY") and os.path.isdir(os.path.join(pssepath, folder)):
+#     #         api_path = os.path.join(pssepath, folder)
+#     #         sys.path.append(api_path)
+#     #         os.environ['PATH'] += ";" + api_path
+#     #         break
+#     # else:
+#     #     raise RuntimeError(f"No PSSPY* folder found under {pssepath}")
+#
+#     # # 2.5 Use PSSPY38 for Python 3.8
+#     # api_path = os.path.join(pssepath, 'PSSPY38')
+#     # if os.path.isdir(api_path):
+#     #     sys.path.append(api_path)
+#     #     os.environ['PATH'] += ";" + api_path
+#     # else:
+#     #     raise RuntimeError(f"PSSPY38 not found at {api_path}")
+#
+#     # 2.6 Inform psseloc of the version
+#     # psseloc._set_psse_loc(psse_version)
+#
+#     # 2.7 Sanity check: ensure path looks correct
+#     if "PTI\\PSSE" not in pssepath:
+#         print(f"ERROR: Cannot find PSS(R)E Version {psse_version}.")
+#         print("INFO: To get the required version of PSS(R)E go this folder: P:\\Models_and_Programs\\PTI Programs\\PSSE and run setup.exe.")
+#         sys.exit(1)
+#
+#     # 2.8 Import and verify PSSE Python API
+#     global psspy
+#     print("sys.path before import:")
+#     for p in sys.path:
+#         print(f"  {p}")
+#     print(f"Trying to import psspy from: {api_path}")
+#     import psspy
+#     print(f"PSSE {psse_version} is alive")
+#
+#     # 2.9 Initialize PSSE engine and logging channels
+#     psspy.psseinit(150000)
+#     ierr = psspy.progress_output(6, None, None)
+#     ierr = psspy.report_output(6, None, None)
+#     ierr = psspy.prompt_output(6, None, None)
+#     ierr = psspy.alert_output(6, None, None)
+#
+#     # 2.10 Retrieve version metadata
+#     name, major, minor, modlvl, date, stat = psspy.psseversion()
+#
+#     ######################### END OF INITIALIZATION ###########################
+#
+#     # 2.11 Grab PSSE’s integer/float/string marker types
+#     _i, _f, _s = psspy._i, psspy._f, psspy._s
+#
+
+# ------------------------------------------------------------------------------
+
+# # 3. Extract generator data from PSSE
+# def Get_Gen_PSSE(modelpath, case, cases, areas):
+#     # 3.1 Find the .sav or .raw network file for this model (prefer .sav if both)
+#     savs = glob.glob(os.path.join(modelpath, "*.sav"))
+#     raws = glob.glob(os.path.join(modelpath, "*.raw"))
+#     if savs:
+#         model = savs[0]
+#         # 3.2a Load the SAV case into PSSE
+#         ierr = psspy.case(model)
+#     elif raws:
+#         model = raws[0]
+#         # 3.2b Load the RAW case into PSSE
+#         #     Arg1 (icase) = 0 to create a new working case
+#         #     Check ierr if needed for diagnostics
+#         ierr = psspy.readraw(0, model)
+#     else:
+#         raise FileNotFoundError(f"No .sav or .raw found in {modelpath}")
+#
+#     # 3.3 Apply a bus‐system filter to include only the specified areas
+#     ierr = psspy.bsys(
+#         0,  # system number
+#         1,  # AND combination
+#         [0.00, 999.00],  # voltage range
+#         len(areas),  # number of areas
+#         areas,  # list of area IDs
+#         0, [], 0, [], 0, []  # unused additional filters
+#     )
+#
+#     # 3.4 Retrieve generator character data: ID and NAME
+#     ierr, carray = psspy.amachchar(0, 4, ['ID', 'NAME'])
+#
+#     # 3.5 Retrieve integer properties: Bus NUMBER, STATUS, OWNERS
+#     ierr, iarray = psspy.amachint(0, 4, ['NUMBER', 'STATUS', 'OWN1', 'OWN2', 'OWN3', 'OWN4'])
+#
+#     # 3.6 Retrieve real properties: PGEN, PMAX, PMIN, and FRACTIONAL ownership
+#     ierr, rarray = psspy.amachreal(0, 4, ['PGEN', 'PMAX', 'PMIN', 'FRACT1', 'FRACT2', 'FRACT3', 'FRACT4'])
+#
+#     # 3.7 Loop over each generator and record its data
+#     for (
+#             busnum,  # generator's bus number
+#             name,  # generator's name
+#             gen_id,  # generator ID string
+#             status,  # on/off status code
+#             pgen,  # current generation MW - MOVED TO MATCH rarray[0]
+#             pmax,  # maximum MW - MOVED TO MATCH rarray[1]
+#             pmin,  # minimum MW - MOVED TO MATCH rarray[2]
+#             own1, own2, own3, own4,
+#             fract1, fract2, fract3, fract4
+#     ) in zip(
+#         iarray[0],  # NUMBER
+#         carray[1],  # NAME
+#         carray[0],  # ID
+#         iarray[1],  # STATUS
+#         rarray[0],  # PGEN - First
+#         rarray[1],  # PMAX - Second
+#         rarray[2],  # PMIN - Third
+#         iarray[2], iarray[3], iarray[4], iarray[5],  # OWN1–4
+#         rarray[3], rarray[4], rarray[5], rarray[6]  # FRACT1–4
+#     ):
+#         # 3.7.1 Find the area for this bus
+#         ierr, area = psspy.busint(busnum, 'AREA')
+#
+#         # 3.7.2 Compute reserve capacity
+#         reserve = float(pmax) - float(pgen)
+#
+#         # 3.7.3 Only store generators with nonzero capability
+#         if float(pmax) > 0.0:
+#             # 3.7.3.1 Clean up whitespace in the ID
+#             clean_id = normalize_id(gen_id)
+#
+#             # 3.7.3.2 Create a unique key combining bus and generator ID
+#             #key = (str(busnum), clean_id)
+#             key = (normalize_bus(busnum), clean_id)
+#
+#             # 3.7.3.3 Add to the global set of generators
+#             all_gens.add(key)
+#
+#             # 3.7.3.4 Store values in dictionaries aligned by case index
+#             PSSE_PMax.setdefault(key, [''] * len(cases))[cases.index(case)] = pmax
+#             PSSE_PMin.setdefault(key, [''] * len(cases))[cases.index(case)] = pmin
+#             PSSE_PGen.setdefault(key, [''] * len(cases))[cases.index(case)] = pgen
+#             PSSE_PRes.setdefault(key, [''] * len(cases))[cases.index(case)] = reserve
+#---------------9/15/2025 change
+# def Get_Gen_PSSE(modelpath, case, cases, areas):
+#     """
+#     Extract generator data from PSSE models (SAV or RAW files)
+#     Compatible with PSS/E 35+ API
+#     """
+#     # 3.1 Find the .sav or .raw network file for this model (prefer .sav if both)
+#     savs = glob.glob(os.path.join(modelpath, "*.sav"))
+#     #raws = glob.glob(os.path.join(modelpath, "*.raw"))
+#
+#     if savs:
+#         model = savs[0]
+#         print(f"Loading SAV file: {model}")
+#         # 3.2a Load the SAV case into PSSE
+#         ierr = psspy.case(model)
+#         if ierr != 0:
+#             raise RuntimeError(f"Failed to load SAV: {model} (ierr={ierr})")
+#     elif raws:
+#         model = raws[0]
+#         print(f"Loading RAW file: {model}")
+#         # 3.2b Load the RAW case into PSSE using correct PSS/E 35+ API
+#
+#
+#         # Debug: Show available read functions
+#         read_functions = [func for func in dir(psspy) if 'read' in func.lower()]
+#         print(f"Available read functions: {read_functions}")
+#
+#         # Try multiple possible function names for maximum compatibility
+#         success = False
+#
+#         # Method 1: Try psspy.read() - standard for PSS/E 35+
+#         if hasattr(psspy, 'read'):
+#             try:
+#                 ierr = psspy.read(0, model)
+#                 if ierr == 0:
+#                     success = True
+#                     print("Successfully loaded using psspy.read()")
+#                 else:
+#                     print(f"psspy.read() returned error code: {ierr}")
+#             except Exception as e:
+#                 print(f"psspy.read() failed: {e}")
+#
+#         # Method 2: Try psspy.readrawversion() - for specific versions
+#         if not success and hasattr(psspy, 'readrawversion'):
+#             try:
+#                 ierr = psspy.readrawversion(numnam=0, ifile=model)
+#                 if ierr == 0:
+#                     success = True
+#                     print("Successfully loaded using psspy.readrawversion()")
+#                 else:
+#                     print(f"psspy.readrawversion() returned error code: {ierr}")
+#             except Exception as e:
+#                 print(f"psspy.readrawversion() failed: {e}")
+#
+#         # Method 3: Try psspy.rawd_2() - alternative for some versions
+#         if not success and hasattr(psspy, 'rawd_2'):
+#             try:
+#                 ierr = psspy.rawd_2(model)
+#                 if ierr == 0:
+#                     success = True
+#                     print("Successfully loaded using psspy.rawd_2()")
+#                 else:
+#                     print(f"psspy.rawd_2() returned error code: {ierr}")
+#             except Exception as e:
+#                 print(f"psspy.rawd_2() failed: {e}")
+#
+#         if not success:
+#             available_funcs = [f for f in dir(psspy) if any(x in f.lower() for x in ['read', 'raw', 'case'])]
+#             raise RuntimeError(f"Could not load RAW file {model}. Available functions: {available_funcs}")
+#
+#         # RAW files load unsolved; run a power flow before querying data
+#         print("Running power flow solve...")
+#         ierr = psspy.fnsl([0, 0, 0, 1, 1, 0, 99, 0])
+#         if ierr not in [0, 1, 2]:  # 0=converged, 1/2=converged with warnings
+#             print(f"Warning: Power flow solve had issues (ierr={ierr}), continuing anyway...")
+#     else:
+#         raise FileNotFoundError(f"No .sav or .raw found in {modelpath}")
+#
+#     # 3.3 Apply a bus-system filter to include only the specified areas
+#     print(f"Applying area filter for areas: {areas}")
+#     ierr = psspy.bsys(
+#         0,  # system number
+#         1,  # AND combination
+#         [0.00, 999.00],  # voltage range
+#         len(areas),  # number of areas
+#         areas,  # list of area IDs
+#         0, [], 0, [], 0, []  # unused additional filters
+#     )
+#     if ierr != 0:
+#         print(f"Warning: Area filter returned ierr={ierr}")
+#
+#     # 3.4 Retrieve generator character data: ID and NAME
+#     print("Retrieving generator character data...")
+#     ierr, carray = psspy.amachchar(0, 4, ['ID', 'NAME'])
+#     if ierr != 0:
+#         raise RuntimeError(f"Failed to retrieve generator character data (ierr={ierr})")
+#
+#     if not carray or not carray[0]:
+#         print(f"Warning: No generators found in areas {areas}")
+#         return
+#
+#     # 3.5 Retrieve integer properties: Bus NUMBER, STATUS, OWNERS
+#     print("Retrieving generator integer data...")
+#     ierr, iarray = psspy.amachint(0, 4, ['NUMBER', 'STATUS', 'OWN1', 'OWN2', 'OWN3', 'OWN4'])
+#     if ierr != 0:
+#         raise RuntimeError(f"Failed to retrieve generator integer data (ierr={ierr})")
+#
+#     # 3.6 Retrieve real properties: PGEN, PMAX, PMIN, and FRACTIONAL ownership
+#     print("Retrieving generator real data...")
+#     ierr, rarray = psspy.amachreal(0, 4, ['PGEN', 'PMAX', 'PMIN', 'FRACT1', 'FRACT2', 'FRACT3', 'FRACT4'])
+#     if ierr != 0:
+#         raise RuntimeError(f"Failed to retrieve generator real data (ierr={ierr})")
+#
+#     # Verify data arrays have same length
+#     gen_count = len(carray[0])
+#     print(f"Found {gen_count} generators")
+#
+#     if not all(len(arr) == gen_count for arr in [carray[0], carray[1], iarray[0], rarray[0]]):
+#         raise RuntimeError("Mismatched data array lengths from PSS/E")
+#
+#     # 3.7 Loop over each generator and record its data
+#     generators_processed = 0
+#     generators_stored = 0
+#
+#     for i in range(gen_count):
+#         try:
+#             # Extract data for this generator
+#             busnum = iarray[0][i]  # Bus NUMBER
+#             name = carray[1][i]  # Generator NAME
+#             gen_id = carray[0][i]  # Generator ID
+#             status = iarray[1][i]  # STATUS
+#             pgen = rarray[0][i]  # PGEN
+#             pmax = rarray[1][i]  # PMAX
+#             pmin = rarray[2][i]  # PMIN
+#
+#             # Owner data
+#             own1, own2, own3, own4 = iarray[2][i], iarray[3][i], iarray[4][i], iarray[5][i]
+#             fract1, fract2, fract3, fract4 = rarray[3][i], rarray[4][i], rarray[5][i], rarray[6][i]
+#
+#             generators_processed += 1
+#
+#             # 3.7.1 Find the area for this bus (optional)
+#             try:
+#                 ierr, area = psspy.busint(busnum, 'AREA')
+#                 if ierr != 0:
+#                     area = None
+#             except:
+#                 area = None
+#
+#             # 3.7.2 Compute reserve capacity
+#             try:
+#                 reserve = float(pmax) - float(pgen)
+#             except (ValueError, TypeError):
+#                 reserve = 0.0
+#
+#             # 3.7.3 Only store generators with nonzero capability
+#             try:
+#                 pmax_val = float(pmax)
+#             except (ValueError, TypeError):
+#                 pmax_val = 0.0
+#
+#             if pmax_val > 0.0:
+#                 clean_id = normalize_id(gen_id)
+#                 key = (normalize_bus(busnum), clean_id)
+#
+#                 all_gens.add(key)
+#
+#                 # Store values in dictionaries aligned by case index
+#                 case_idx = cases.index(case)
+#                 PSSE_PMax.setdefault(key, [''] * len(cases))[case_idx] = pmax
+#                 PSSE_PMin.setdefault(key, [''] * len(cases))[case_idx] = pmin
+#                 PSSE_PGen.setdefault(key, [''] * len(cases))[case_idx] = pgen
+#                 PSSE_PRes.setdefault(key, [''] * len(cases))[case_idx] = reserve
+#
+#                 generators_stored += 1
+#
+#         except Exception as e:
+#             print(f"Error processing generator {i}: {e}")
+#             continue
+#
+#     print(f"Processed {generators_processed} generators, stored {generators_stored} with PMax > 0")
+#     print(f"Case '{case}' processing complete")
+#----- added this code
+# 3. Extract generator data from PSSE (rewritten, no logger)
+def Get_Gen_PSSE(modelpath: str, case: str, cases: list[str], areas: list[int]) -> None:
+    """
+    Load a model (.sav preferred, else .raw for PSSE 35), solve power flow,
+    filter to the requested areas, and record generator data into global dicts:
+        PSSE_PMax, PSSE_PMin, PSSE_PGen, PSSE_PRes, all_gens
+    Keys are (normalize_bus(busnum), normalize_id(gen_id)).
+    """
+
+    # 3.1 Find model file (.sav first, else .raw)
+    savs = glob.glob(os.path.join(modelpath, "*.sav"))
+    raws = glob.glob(os.path.join(modelpath, "*.raw"))
+
+    if savs:
+        model = savs[0]
+        ierr = psspy.case(model)
+        if ierr != 0:
+            raise RuntimeError(f"Failed to load SAV: {model} (ierr={ierr})")
+        psspy.fnsl([0, 0, 0, 1, 1, 0, 99, 0])
+
+    elif raws:
+        model = raws[0]
+        loaded = False
+        if hasattr(psspy, "read"):
+            try:
+                ierr = psspy.read(0, model)
+                loaded = (ierr == 0)
+            except Exception:
+                loaded = False
+
+        # Fallbacks if needed
+        if not loaded and hasattr(psspy, "readrawversion"):
+            try:
+                # Minimal args; signature varies by build
+                ierr = psspy.readrawversion(0, model, 0)
+                loaded = (ierr == 0)
+            except Exception:
+                loaded = False
+
+        if not loaded and hasattr(psspy, "rawd_2"):
+            try:
+                # rawd_2 signatures vary; this one works on many installs
+                # (ifile) or (icase, string) variants exist—try simplest first
+                ierr = psspy.rawd_2(model)
+                loaded = (ierr == 0)
+            except Exception:
+                loaded = False
+
+        if not loaded:
+            raise RuntimeError(f"Could not load RAW: {model} (psspy.read/readrawversion/rawd_2 not available)")
+
+        # RAWs load unsolved; run a power-flow solve
+        ierr = psspy.fnsl([0, 0, 0, 1, 1, 0, 99, 0])
+        # ierr: 0=converged; 1/2=converged with adjustments; others are warnings/errors.
+        # We continue even if >2 to allow inspection downstream, but capture data best-effort.
+
+    else:
+        raise FileNotFoundError(f"No .sav or .raw found in {modelpath}")
+
+    # 3.2 Apply area filter
+    # system=0 (default), AND-combine=1, voltage range wide open, focus on 'areas'
+    ierr = psspy.bsys(0, 1, [0.0, 999.0], len(areas), areas, 0, [], 0, [], 0, [])
+    # proceed regardless of ierr; some versions return nonzero with empty result sets
+
+    # 3.3 Pull generator data
+    ierr, carray = psspy.amachchar(0, 4, ['ID', 'NAME'])
+    if ierr != 0 or not carray or not carray[0]:
+        # Nothing to record for these areas
+        return
+
+    ierr, iarray = psspy.amachint(0, 4, ['NUMBER', 'STATUS', 'OWN1', 'OWN2', 'OWN3', 'OWN4'])
+    if ierr != 0:
+        raise RuntimeError(f"amachint failed (ierr={ierr})")
+
+    ierr, rarray = psspy.amachreal(0, 4, ['PGEN', 'PMAX', 'PMIN', 'FRACT1', 'FRACT2', 'FRACT3', 'FRACT4'])
+    if ierr != 0:
+        raise RuntimeError(f"amachreal failed (ierr={ierr})")
+
+    # 3.4 Basic length sanity
+    gen_count = len(carray[0])  # IDs
+    if not all(len(arr) == gen_count for arr in (carray[1], iarray[0], iarray[1], rarray[0], rarray[1], rarray[2])):
+        # Arrays not aligned—abort cleanly to avoid writing bad rows
+        raise RuntimeError("PSS/E arrays returned mismatched lengths for generator data")
+
+    # 3.5 Record generators
+    case_idx = cases.index(case)  # where to write in the per-case arrays
+    stored = 0
+
+    for i in range(gen_count):
+        # Pull fields
+        busnum = iarray[0][i]   # NUMBER
+        gen_id = carray[0][i]   # ID
+        pgen   = rarray[0][i]   # PGEN
+        pmax   = rarray[1][i]   # PMAX
+        pmin   = rarray[2][i]   # PMIN
+
+        # Normalize key
+        try:
+            key = (normalize_bus(busnum), normalize_id(gen_id))
+        except Exception:
+            # If normalization fails, skip this row
+            continue
+
+        # Only keep units with positive capability
+        try:
+            pmax_val = float(pmax)
+        except (TypeError, ValueError):
+            pmax_val = 0.0
+
+        if pmax_val <= 0.0:
+            continue
+
+        # Compute reserve = PMAX - PGEN (defensive casts)
+        try:
+            reserve = float(pmax) - float(pgen)
+        except (TypeError, ValueError):
+            reserve = 0.0
+
+        # Track this generator in the global set
+        all_gens.add(key)
+
+        # Ensure lists exist, then set by case index
+        PSSE_PMax.setdefault(key, [''] * len(cases))[case_idx] = pmax
+        PSSE_PMin.setdefault(key, [''] * len(cases))[case_idx] = pmin
+        PSSE_PGen.setdefault(key, [''] * len(cases))[case_idx] = pgen
+        PSSE_PRes.setdefault(key, [''] * len(cases))[case_idx] = reserve
+
+        stored += 1
+
+    # Optionally, you can uncomment prints for quick visibility:
+    # print(f"[{case}] {stored} generators stored (PMax>0) from {modelpath}")
+# ------------------------------------------------------------------------------
+
+# 4. Retrieve stored PSSE values for a given generator and case
+def Get_PSSE_Values(case, busnum, genid, dictionaries):
+    # 4.1 Start with an empty list of values
+    values = []
+    # # 4.3 Return the complete list [PMax, PMin, PGen, PRes] (or empty slots)
+    # return values
+    if isinstance(busnum, (int, float)):
+        norm_bus = normalize_bus(busnum)
+    else:
+        norm_bus = str(busnum)  # Already normalized
+
+    # genid should already be normalized by caller
+    norm_id = str(genid)
+
+    for dictionary in dictionaries:
+        try:
+            value = dictionary[(norm_bus, norm_id)][cases.index(case)]
+        except Exception as e:
+            value = []
+        values.append(value)
+
+    return values
+# ------------------------------------------------------------------------------
+# 5. Build grouped generator entries from an Excel workbook
+def Get_Gen_Groupings(GroupingDir, GroupBook):
+    # 5.1 Initialize a set to track which generators we've assigned
+    all_grouped_gens = set()
+
+    # 5.2 Create an Excel helper instance and open the workbook
+    xl1 = Excel_Document()
+    # 5.2.1 Find the first matching file (ignoring temp "~" files)
+    wb = next(x for x in glob.glob(os.path.join(GroupingDir, GroupBook)) if "~" not in x)
+    xl1.openWorkbook(wb)
+
+    # 5.3 Loop through each relevant sheet (here only "Grouped")
+    for sheetname in ["Grouped"]:
+        # 5.3.1 Read all rows from that sheet
+        sheet = xl1.getSheetData(sheetname)
+
+        # 5.3.2 Skip the header row, iterate data rows
+        for row in sheet[1:]:
+            if not row:
+                continue  # empty row, skip
+
+            # Check if row has enough columns
+            if len(row) < 8:
+                print(f"WARNING: Row has only {len(row)} columns, expected 8. Skipping.")
+                continue
+
+            # 5.3.3 Unpack raw Excel columns into variables (FIXED POSITIONS)
+            groupname = row[0]  # Column A - Group number/name
+            groupelement = str(row[1])  # Column B - Group element index
+            plantname = str(row[2])  # Column C - Plant name/index
+            busnum = int(float(row[3]))  # Column D - Bus number (converted from float cell)
+            busname = str(row[4])  # Column E - Bus name
+            genid = row[5]  # Column F - Generator ID
+            longname = str(row[6])  # Column G - Long generator name
+            category = str(row[7])  # Column H - Category
+
+            # 5.3.4 Normalize "None" to empty string
+            if groupname == "None":
+                groupname = ""
+
+            # 5.3.5 Track this generator as seen
+            all_grouped_gens.add((str(busnum), str(genid).strip()))
+
+            # 5.3.6 Clean up group and plant names (remove punctuation, trim length)
+            try:
+                groupname = str(int(float(groupname)))
+            except Exception:
+                groupname = str(groupname)
+            try:
+                plantname = str(int(float(plantname)))
+            except Exception:
+                plantname = str(plantname)
+
+            # Clean up generator ID
+            try:
+                genid = int(float(genid))
+            except Exception:
+                genid = str(genid)
+
+            # Remove special characters from names
+            for ch in [".", "(", ":", ")"]:
+                groupname = groupname.replace(ch, "")
+                plantname = plantname.replace(ch, "")
+
+            # Truncate long names
+            if len(groupname) > 17:
+                groupname = groupname[:17].replace("-", "_")
+            if len(plantname) > 17:
+                plantname = plantname[:17].replace("-", "_")
+
+            # 5.3.7 Double-check presence (already done above, but keeping for consistency)
+            all_grouped_gens.add((str(busnum), str(genid).strip()))
+
+            # 5.3.8 For each case, fetch PSSE values and create Entry objects
+            for case in cases:
+                vals = Get_PSSE_Values(case, busnum, genid, [PSSE_PMax, PSSE_PMin, PSSE_PGen, PSSE_PRes])
+
+                # 5.3.8.1 Skip if no data for this generator
+                if vals == [[], [], [], []]:
+                    continue
+
+                # 5.3.8.2 Prepare the data row (includes category)
+                data = [
+                    groupname, plantname, busnum, busname, genid,
+                    longname, category, vals[0], vals[1], vals[2], vals[3]
+                ]
+                entry = Entry(case_header_array[cases.index(case)], data)
+
+                # 5.3.8.3 Insert into the nested grouped_dic:
+                #         grouped_dic[case][groupname][plantname].append(entry)
+                try:
+                    case_dict = grouped_dic[case]
+                except KeyError:
+                    grouped_dic[case] = {groupname: {plantname: [entry]}}
+                else:
+                    group_dict = case_dict.get(groupname, {})
+                    plant_list = group_dict.get(plantname, [])
+                    plant_list.append(entry)
+                    group_dict[plantname] = plant_list
+                    case_dict[groupname] = group_dict
+
+    # 5.4 Identify any generators never grouped
+    missing = [list(g) for g in all_gens if g not in all_grouped_gens]
+    if missing:
+        print(f"[INFO] {len(missing)} PSSE generators not found in Excel grouping file")
+        # 5.4.1 Write them into a "Missing Gen" sheet
+        try:
+            xl1.addWorksheet("Missing Gen")
+            xl1.selectSheet("Missing Gen")
+        except Exception:
+            xl1.selectSheet("Missing Gen")
+        xl1.pasteData(missing, start_row=1, start_col=1, end_row=len(missing), end_col=2)
+        xl1.autoFilter(1)
+
+    # 5.5 Save and close the workbook
+    try:
+        xl1.saveWorkbook(os.path.join(GroupingDir, GroupBook.split(".")[0]))
+        print("[INFO] Grouping workbook saved successfully")
+    except Exception as e:
+        print(f"[WARNING] Could not save grouping workbook (it may be read-only or open): {e}")
+        print("[INFO] Continuing without saving - the Missing Gen sheet will not be saved")
+
+    try:
+        xl1.closeWorkbook()
+        xl1.closeApp()
+    except Exception as e:
+        print(f"[WARNING] Error closing Excel: {e}")
+
+# ------------------------------------------------------------------------------
+# 6. Write subsystem definitions for TARA (“.sub” files)
+def SUB_INTITIAL(file, spp_all_sub, spp_load_sub):
+    # 6.1 Start the “spp_all” subsystem block
+    file.write("SUBSYSTEM 'spp_all'\n")
+
+    # 6.2 For each area in the all‐subsystem spec, write an AREA line
+    for area_info in spp_all_sub['areas']:
+        # area_info is a tuple like (area_number, area_name)
+        # FIX: close the C-style comment with '*/'
+        file.write("  AREA %s /*%s*/\n" % tuple(area_info))
+
+    # 6.3 Write the SCALE line and close that subsystem
+    file.write("  SCALE ALL FOR EXPORT INCLUDE OFFLINE\nEND\n\n")
+
+    # 6.4 Start the “SPP_LOAD” subsystem block
+    file.write("SUBSYSTEM 'SPP_LOAD'\n")
+
+    # 6.5 For each area in the load‐subsystem spec, write an AREA line
+    for area_info in spp_load_sub['areas']:
+        file.write("  AREA %s /*%s*/\n" % tuple(area_info))
+
+    # 6.6 Write the SCALE LOAD line and close that subsystem
+    file.write("  SCALE ALL LOAD\nEND\n")
+
+    # 6.7 (Optional) The original template had BUSNUMBERS here:
+    # file.write("BUSNUMBERS\n")
+
+
+# ------------------------------------------------------------------------------
+
+# 7. Generate subsystem and transfer files; build per‐case master Excel
+def Create_Sub_Transactions(SubDir, TransDir, RunDir, spp_all_sub, spp_load_sub):
+    # 7.1 Create a new Excel workbook
+    xl1 = Excel_Document()
+    xl1.addWorkbook()
+
+    # 7.2 Loop through each case and its grouped plants
+    for case, groups in grouped_dic.items():  # was .iteritems() in Py2
+        # 7.2.1 Prepare data structures and file paths
+        case_data    = []
+        case_header  = case_header_array[cases.index(case)]
+        casesub      = os.path.join(SubDir,  case, f"Sub__{case}.sub")
+        casetrans    = os.path.join(TransDir, case, f"Tara_Trans__{case}.csv")
+
+        # 7.2.2 Open the CSV and .sub files
+        with open(casetrans, 'w', newline='') as csvfile, open(casesub, 'w') as textfile:
+            # 7.2.2.1 CSV header
+            csvfile.write('TARA List of Defined Paths and Max redispatch test levels\n')
+            # 7.2.2.2 Write the two static subsystems
+            SUB_INTITIAL(textfile, spp_all_sub, spp_load_sub)
+
+            # 7.2.3 Loop through each grouping (plant or system)
+            for grouping, plants in groups.items():  # Py3: .items()
+                # 7.2.3.1 Normalize grouping name to string
+                try:
+                    grouping = str(int(float(grouping)))
+                except Exception:
+                    grouping = str(grouping)
+
+                # 7.2.3.2 Collect all entries for this grouping
+                group_entries = []
+                for plant, vals in plants.items():  # .items() in Py3
+                    # 7.2.3.2.1 Normalize plant name
+                    try:
+                        plant = str(int(float(plant)))
+                    except Exception:
+                        plant = str(plant)
+
+                    # 7.2.3.2.2 Filter out entries with zero PMax
+                    values = []
+                    for entry in vals:
+                        try:
+                            test  = float(entry[f'{case}_PMax'])
+                            test2 = float(entry[f'{case}_PReserve'])
+                            if test != 0.0:
+                                values.append(entry)
+                        except Exception:
+                            print(f"Case: {case}, Bus: {entry.Bus_Number}, Id: {entry.ID}, "
+                                  f"Pmax: {entry[f'{case}_PMax']}, PReserve: {entry[f'{case}_PReserve']}")
+                    if not values:
+                        continue
+
+                    # 7.2.3.2.3 Write plant subsystem
+                    textfile.write(f"\nSUBSYSTEM '{plant}'")
+                    dup_bus = []
+                    for entry in values:
+                        case_data.append([entry[h] for h in case_header])
+                        group_entries.append(entry)
+                        if entry.Bus_Number not in dup_bus:
+                            textfile.write(f"\nBUS {entry.Bus_Number}")
+                            dup_bus.append(entry.Bus_Number)
+                    textfile.write("\nSCALE ALL FOR EXPORT INCLUDE OFFLINE\nEND\n")
+
+                    # 7.2.3.2.4 Write CSV transfer line and record totals
+                    reserve = sum(entry[f'{case}_PReserve'] for entry in values)
+                    pmax    = sum(entry[f'{case}_PMax']     for entry in values)
+                    pgen    = sum(entry[f'{case}_PGen']     for entry in values)
+                    csvfile.write(f'{plant},SPP_LOAD,{reserve}\n')
+                    group_plant_totals[(case, plant)] = [pmax, pgen, reserve]
+
+                # 7.2.3.3 If multiple plants, write a grouping subsystem
+                if len(plants) > 1:
+                    textfile.write(f"\nSUBSYSTEM '{grouping}'")
+                    dup_bus = []
+                    for entry in group_entries:
+                        if entry.Bus_Number not in dup_bus:
+                            textfile.write(f"\nBUS {entry.Bus_Number}")
+                            dup_bus.append(entry.Bus_Number)
+                    textfile.write("\nSCALE ALL FOR EXPORT INCLUDE OFFLINE\nEND\n")
+
+                    reserve = sum(entry[f'{case}_PReserve'] for entry in group_entries)
+                    pmax    = sum(entry[f'{case}_PMax']     for entry in group_entries)
+                    pgen    = sum(entry[f'{case}_PGen']     for entry in group_entries)
+                    csvfile.write(f'{grouping},SPP_LOAD,{reserve}\n')
+                    group_plant_totals[(case, grouping)] = [pmax, pgen, reserve]
+
+        # 7.2.4 Close files automatically via context managers
+
+        # 7.2.5 Sort and write the master Excel sheet for this case
+        sorted_list = sorted(case_data, key=lambda el: el[0])
+        xl1.addWorksheet(case)
+        xl1.selectSheet(case)
+        xl1.pasteData(case_header, start_row=1, start_col=1,
+                      end_row=1, end_col=len(case_header))
+        xl1.pasteData(sorted_list, start_row=2, start_col=1,
+                      end_row=len(sorted_list) + 1, end_col=len(case_header))
+        xl1.autoFilter(1)
+
+    # 7.3 Save and close the “Master” workbook
+    xl1.saveWorkbook(os.path.join(RunDir, "Master"))
+    xl1.closeWorkbook()
+    xl1.closeApp()
+
+
+# ------------------------------------------------------------------------------
+
+# 8. Write a template file to disk
+def write_template(file_name, template_string):
+    # 8.1 Open (or create) the file in read/write mode, UTF-8 encoded
+    with open(file_name, "w+", encoding="utf-8") as text_file:
+        # 8.2 Write the provided template text into the file
+        text_file.write(template_string)
+
+
+# ------------------------------------------------------------------------------
+
+def Create_Runs(cwd, psse_version, ConDir, MonDir, SubDir, TransDir, RunDir, modelpaths):
+    # 9.1 Instantiate the template generator
+    DTF = Deliverability_Template_Files()
+    tara_exe = os.path.join(cwd, "tara.exe")
+
+    # 9.2 Loop over each model folder (one per “season”/case)
+    for modelpath in modelpaths:
+        print(modelpath)
+
+        # 9.2.1 Locate the .raw file
+        raw_files = glob.glob(os.path.join(modelpath, "*.raw"))
+        if not raw_files:
+            print(f"  [9.2.1]  No .raw file found in {modelpath}")
+            continue
+        case_path = raw_files[0]
+        case = os.path.basename(case_path).split(".")[0]
+        season = os.path.basename(modelpath)
+
+        # 9.2.2 Collect required inputs
+        missing = []
+        con_files = glob.glob(os.path.join(ConDir, season, "*.con"))
+        if not con_files:
+            missing.append(f"[9.2.2]  Missing .con file in {os.path.join(ConDir, season)}")
+
+        mon_files = glob.glob(os.path.join(MonDir, season, "*.mon"))
+        if not mon_files:
+            missing.append(f"[9.2.2]  Missing .mon file in {os.path.join(MonDir, season)}")
+
+        sub_files = glob.glob(os.path.join(SubDir, season, "*.sub"))
+        if not sub_files:
+            missing.append(f"[9.2.2]  Missing .sub file in {os.path.join(SubDir, season)}")
+
+        trans_files = glob.glob(os.path.join(TransDir, season, "*.csv"))
+        if not trans_files:
+            missing.append(f"[9.2.2]  Missing .csv transaction file in {os.path.join(TransDir, season)}")
+
+        exc_files = glob.glob(os.path.join(ConDir, "*.exc"))
+        if not exc_files:
+            missing.append(f"[9.2.2]  Missing .exc contingency file in {ConDir}")
+
+        if not os.path.isfile(tara_exe):
+            missing.append(f"[9.2.2]  Missing TARA executable at {tara_exe}")
+
+        # 9.2.3 If anything missing, report and skip
+        if missing:
+            print(f"\nCase: {case}  Input Check Failed")
+            for m in missing:
+                print("   -", m)
+            print("")
+            continue
+
+        # 9.2.4 If we got here, all required files exist
+        input_files = [con_files[0], mon_files[0], sub_files[0],
+                       trans_files[0], case_path, exc_files[0], tara_exe]
+
+        os.makedirs(os.path.join(RunDir, season), exist_ok=True)
+
+        # 9.2.5 Generate and write template files
+        write_template(os.path.join(RunDir, season, "TARA_Multi_Transfer_Limit.py"),
+                       DTF.tara_multi_transfer_limit())
+        write_template(os.path.join(RunDir, season, "Template_TrLimMultiPath.txt"),
+                       DTF.tara_trlim_multipath(psse_version))
+        write_template(os.path.join(RunDir, season, "tat_config1.txt"),
+                       DTF.tara_config())
+
+        # 9.2.6 Copy each input file
+        for src_file in input_files:
+            dst = os.path.join(RunDir, season, os.path.basename(src_file).replace(" ", "_"))
+            shutil.copy(src_file, dst)
+            print(f"[9.2.6]  Copied {src_file}  {dst}")
+
+# ------------------------------------------------------------------------------
+
+# 10. Retrieve data from an existing Excel workbook sheet
+def retreive_excel_data(workbook, sheetname):
+    # 10.1 Create a temporary Excel helper instance
+    xltemp = Excel_Document()
+    # 10.2 Open the specified workbook file
+    xltemp.openWorkbook(workbook)
+    # 10.3 Read all data from the given sheet name
+    sheet_data = xltemp.getSheetData(sheetname)
+    # 10.4 Close the workbook and quit Excel to release resources
+    xltemp.closeWorkbook()
+    xltemp.closeApp()
+    # 10.5 Return the raw sheet data (list of rows)
+    return sheet_data
+
+
+# ------------------------------------------------------------------------------
+
+# 11. Post-process TARA results and build the final “Master_w_TARA_Results” workbook
+def Post_Process_Results(RunDir):
+    # 11.1 Create a new Excel workbook for the aggregated results
+    xl1 = Excel_Document()
+    xl1.addWorkbook()
+
+    # 11.2 Loop through each case to extract its transfer-limit sheet
+    for case in cases:
+        # 11.2.1 Initialize a dict to hold the minimum transfer limit per subsystem
+        tara_dic = {}
+
+        # 11.2.2 Read the “TrLim” sheet from the existing Proportional_Tranfer_Limit.xlsx
+        sheet = retreive_excel_data(
+            os.path.join(RunDir, case, "Proportional_Tranfer_Limit.xlsx"),
+            "TrLim"
+        )
+
+        # 11.2.3 Prepare a new worksheet named “TARA_<case>”
+        sheet_name = f"TARA_{case}"
+        xl1.addWorksheet(sheet_name)
+        xl1.selectSheet(sheet_name)
+
+        # 11.2.4 Dump the raw sheet data into rows 1…N
+        xl1.pasteData(
+            sheet,
+            start_row=1, start_col=1,
+            end_row=len(sheet),
+            end_col=len(sheet[11])
+        )
+        xl1.autoFilter(12)
+
+        # 11.2.5 Scan rows 12…end to compute the minimum transfer limit per subsystem
+        for row in sheet[11:]:
+            # 11.2.5.1 Skip any header or “Sending …” lines
+            if "Sending " in str(row[0]):
+                continue
+
+            # 11.2.5.2 Normalize the subsystem ID (attempt integer, else string)
+            try:
+                subsystem = str(int(float(row[0])))
+            except Exception:
+                subsystem = str(row[0])
+
+            # 11.2.5.3 Read the transfer limit, fallback to column 2 if column 14 is blank
+            try:
+                trlim = float(row[14])
+            except Exception:
+                trlim = float(row[2])
+
+            # 11.2.5.4 Track the minimum trlim per subsystem
+            prev = tara_dic.get(subsystem)
+            if prev is None or trlim < prev:
+                tara_dic[subsystem] = trlim
+
+        # 11.3 Read the “Master.xlsx” sheet for this case to merge with TARA results
+        master_sheet = retreive_excel_data(os.path.join(RunDir, "Master.xlsx"), case)
+
+        # 11.3.1 Build the header row by appending TARA columns
+        header = (
+            case_header_array[cases.index(case)] + [
+                "Plant TRM Limit", "Plant Max", "Plant Gen", "Plant Reserve",
+                "Plant Deliverable MW", "Plant Deliverable %",
+                "Group TRM Limit", "Group Max", "Group Gen", "Group Reserve",
+                "Group Deliverable MW", "Group Deliverable %",
+                "Final MW", "Final %"
+            ]
+        )
+
+        # 11.3.2 Prepare a list to collect the output rows
+        data = []
+
+        # 11.3.3 Iterate each row of the master sheet (skip header)
+        for row in master_sheet[1:]:
+            # 11.3.3.1 Unpack the first 11 columns
+            (
+                grpname, pltname, busnum, busname, genid,
+                longname, category, pmax, pmin, pgen, pres
+            ) = (
+                row[0], str(row[1]), row[2], str(row[3]),
+                row[4], str(row[5]), str(row[6]),
+                row[7], row[8], row[9], row[10]
+            )
+
+            # 11.3.3.2 Normalize group/plant/gen IDs
+            try:    grpname = str(int(float(grpname)))
+            except: grpname = str(grpname)
+            try:    pltname = str(int(float(pltname)))
+            except: pltname = str(pltname)
+            try:    genid  = int(float(genid))
+            except: genid  = str(genid)
+
+            # 11.3.3.3 Lookup group‐level totals and trlim
+            try:
+                grp_pmax, grp_pgen, grp_pres = group_plant_totals[(case, grpname)]
+                grp_trlim = float(tara_dic[grpname])
+                grp_mw    = grp_pgen + grp_trlim
+                grp_prct  = min((grp_mw / grp_pmax) * 100, 100.0)
+            except Exception:
+                grp_trlim = grp_pmax = grp_pgen = grp_pres = grp_mw = grp_prct = ""
+
+            # 11.3.3.4 Lookup plant‐level totals and trlim
+            try:
+                plt_pmax, plt_pgen, plt_pres = group_plant_totals[(case, pltname)]
+                plt_trlim = float(tara_dic.get(pltname.replace("-", "_"), 0.0))
+                plt_mw    = plt_pgen + plt_trlim
+                plt_prct  = min((plt_mw / plt_pmax) * 100, 100.0)
+            except Exception:
+                plt_trlim = plt_pmax = plt_pgen = plt_pres = plt_mw = plt_prct = 0.0
+
+            # 11.3.3.5 Compute final deliverable MW/% if group‐reserve > 0
+            if grp_trlim and grp_pres:
+                final_mw   = (plt_pres / grp_pres) * grp_trlim + plt_pgen
+                final_prct = min((final_mw / plt_pmax) * 100, 100.0)
+            else:
+                final_mw   = plt_mw
+                final_prct = plt_prct
+
+            # 11.3.3.6 Append the completed row
+            data.append([
+                grpname, pltname, busnum, busname, genid,
+                longname, category, pmax, pmin, pgen, pres,
+                plt_trlim, plt_pmax, plt_pgen, plt_pres, plt_mw, plt_prct,
+                grp_trlim, grp_pmax, grp_pgen, grp_pres, grp_mw, grp_prct,
+                final_mw, final_prct
+            ])
+
+        # 11.4 Write the merged header & data into a new sheet named after the case
+        xl1.addWorksheet(case)
+        xl1.selectSheet(case)
+        xl1.pasteData(header, start_row=1, start_col=1, end_row=1, end_col=len(header))
+        xl1.pasteData(data,   start_row=2, start_col=1, end_row=len(data) + 1, end_col=len(header))
+        xl1.autoFilter(1)
+
+    # 11.5 Save and close the final workbook
+    xl1.saveWorkbook(os.path.join(RunDir, "Master_w_TARA_Results"))
+    xl1.closeWorkbook()
+    xl1.closeApp()
+
+
+# ------------------------------------------------------------------------------
+
+# 12. Create RAW workbooks if TARA results exist
+def Create_Raw_Workbook(RunDir):
+    # 12.1 Pause briefly to allow file writes to complete
+    time.sleep(3)
+    # 12.2 If the final results workbook is present
+    if os.path.isfile(os.path.join(RunDir, "Master_w_TARA_Results.xlsx")):
+        # 12.3 Launch the RAW workbook generator with the same Python interpreter
+        p = subprocess.Popen([sys.executable, 'Create_RAW_Worbooks.py'])
+        p.communicate()
+
+
+# ------------------------------------------------------------------------------
+
+# 13. Launch TARA runs for each case
+def Run_Tara(RunDir):
+    # 13.1 For each case folder, change into it and start the TARA script
+    for case in cases:
+        folder = os.path.join(RunDir, case)
+        # 13.1.1 Launch via current Python interpreter
+        subprocess.Popen([sys.executable, 'TARA_Multi_Transfer_Limit.py'], cwd=folder)
+    # 13.2 Wait until each case’s output file appears before returning
+    for case in cases:
+        output_xlsx = os.path.join(RunDir, case, "Proportional_Tranfer_Limit.xlsx")
+        while not os.path.exists(output_xlsx):
+            time.sleep(1)
+
+
+# ------------------------------------------------------------------------------
+
+# 14. Verify that all required folders and files are in place
+def check_folder_structure(ModelDir, cases, ConDir, MonDir):
+    exit_flag = False
+
+    # 14.1 No model folders found → error
+    if not cases:
+        exit_flag = True
+        print(f"\nNo model folder found under: {ModelDir}")
+        print("Place each *.raw file in its own model folder, and create matching subfolders in CON and MON.")
+    else:
+        for case in cases:
+            # 14.2 Case name too long → error
+            if len(case) >= 30:
+                exit_flag = True
+                print(f"\nModel folder name too long: {case}")
+
+            # 14.3 Check CON folder and .con files
+            conpath = os.path.join(ConDir, case)
+            if not os.path.isdir(conpath) or not glob.glob(os.path.join(conpath, "*.con")):
+                exit_flag = True
+                print(f"\nMissing CON folder or .con file: {conpath}")
+
+            # 14.4 Check MON folder and .mon files
+            monpath = os.path.join(MonDir, case)
+            if not os.path.isdir(monpath) or not glob.glob(os.path.join(monpath, "*.mon")):
+                exit_flag = True
+                print(f"\nMissing MON folder or .mon file: {monpath}")
+
+    # 14.5 If any problem, exit with error
+    if exit_flag:
+        sys.exit(1)
+
+
+# ------------------------------------------------------------------------------
+
+# 15. Top‐level: orchestrate all steps to build, run, and process TARA transfers
+def Create_TARA_Sub_Transfers(
+    cwd, psse_version, areas,
+    ModelDir, ConDir, MonDir, SubDir, TransDir,
+    GroupDir, GroupBook, RunDir,
+    spp_all_sub, spp_load_sub
+):
+    start = timeit.default_timer()
+
+    # 15.1 Initialize global data structures
+    global PSSE_PMax, PSSE_PMin, PSSE_PGen, PSSE_PRes
+    global grouped_dic, group_plant_totals, all_gens, cases, case_header_array
+
+    PSSE_PMax = {}
+    PSSE_PMin = {}
+    PSSE_PGen = {}
+    PSSE_PRes = {}
+    group_plant_totals = {}
+    grouped_dic = {}
+    all_gens = set()
+
+    # 15.2 Discover model paths and case names
+    modelpaths = [os.path.join(ModelDir, d) for d in os.listdir(ModelDir) if "." not in d]
+    cases = [os.path.basename(mp) for mp in modelpaths]
+    case_header_array = []
+
+    # 15.3 Validate folder structure
+    check_folder_structure(ModelDir, cases, ConDir, MonDir)
+
+    # 15.4 Initialize PSSE API
+    init_psse(psse_version)
+
+    # 15.5 Extract generator data from each model
+    for mp in modelpaths:
+        case = os.path.basename(mp)
+        header = [
+            'Group_Name', 'Plant_Name', 'Bus_Number', 'Bus_Name', 'ID',
+            'Long_Name', 'Category',
+            f'{case}_PMax', f'{case}_PMin', f'{case}_PGen', f'{case}_PReserve'
+        ]
+        case_header_array.append(header)
+        Get_Gen_PSSE(mp, case, cases, areas)
+    print("Finished getting model info:", round((timeit.default_timer() - start)/60, 2), "Minutes")
+
+    # 15.6 Build groupings from Excel
+    Get_Gen_Groupings(GroupDir, GroupBook)
+    print("Finished gen grouping:", round((timeit.default_timer() - start)/60, 2), "Minutes")
+
+    # 15.7 Ensure output directories exist
+    Check_Directories([ConDir, MonDir, SubDir, TransDir, RunDir], cases)
+
+    # 15.8 Create subsystem & transfer files
+    Create_Sub_Transactions(SubDir, TransDir, RunDir, spp_all_sub, spp_load_sub)
+    print("Finished creating sub & transfer files:", round((timeit.default_timer() - start)/60, 2), "Minutes")
+
+    # 15.9 Prepare run folders
+    Create_Runs(cwd, psse_version, ConDir, MonDir, SubDir, TransDir, RunDir, modelpaths)
+    print("Finished creating run folders:", round((timeit.default_timer() - start)/60, 2), "Minutes")
+
+    # 15.10 Optionally fire off TARA runs (if ≤4 cases)
+    if len(cases) <= 4:
+        Run_Tara(RunDir)
+        print("Finished TARA runs:", round((timeit.default_timer() - start)/60, 2), "Minutes")
+
+    # 15.11 Post-process and save final results
+    Post_Process_Results(RunDir)
+    print("Finished post-processing results:", round((timeit.default_timer() - start)/60, 2), "Minutes")
+
+    # 15.12 (Optional) Create raw workbooks
+    #Create_Raw_Workbook(RunDir)
+    #print("Finished all tasks in:", round((timeit.default_timer() - start)/60, 2), "Minutes")
