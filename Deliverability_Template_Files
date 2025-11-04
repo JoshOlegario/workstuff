@@ -314,7 +314,7 @@ lfopt adj
  PAR_AdjEnabledLF           1  
  areaInterAdjustEnabled     0
  TAP_AdjEnabledLF           1  
- shuntAdjEnabled            0  
+ shuntAdjEnabled            2  
  DCLineAdjEnabled           1
  showParAdj                 1  
  showTapAdj                 1 
@@ -525,12 +525,12 @@ lfopt adj
  iterCheckVarLimitFlat      3
  PAR_AdjEnabledLF           1  
  areaInterAdjustEnabled     0
- TAP_AdjEnabledLF           1 
+ TAP_AdjEnabledLF           0 
  shuntAdjEnabled            0 
  DCLineAdjEnabled           1
  showParAdj                 1  
  showTapAdj                 1  
- showShuntAdj               0  
+ showShuntAdj               1  
  showAreaInterAdj           1  
  busMismTolerAreaInter      5  
  maxVarLimitsBusTypeChanges 6
@@ -650,7 +650,7 @@ lfopt adj
  iterCheckVarLimitFlat      3
  PAR_AdjEnabledLF           1
  areaInterAdjustEnabled     0
- TAP_AdjEnabledLF           1
+ TAP_AdjEnabledLF           0
  shuntAdjEnabled            0
  DCLineAdjEnabled           0    
  showParAdj                 0  
